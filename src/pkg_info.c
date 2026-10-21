@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "filemgr_internal.h"
+#include "http_range.h"
 #include "json_util.h"
 #include "path_util.h"
 #include "websrv.h"
@@ -32,6 +33,9 @@
 #define SFO_ENTRY_SIZE 0x10
 #define SFO_ENTRY_MAX 256u
 #define JSON_TOKEN_MAX 4096u
+/* First remote range; covers the header, entry table and param of typical PKGs. */
+#define PKG_URL_WINDOW (256u * 1024u)
+#define PKG_URL_TIMEOUT_MS 10000
 
 typedef enum pkg_param_type {
   PKG_PARAM_SFO,
@@ -41,6 +45,8 @@ typedef enum pkg_param_type {
 typedef struct pkg_source {
   int fd;
   int borrowed;
+  pkg_read_fn reader; /* Optional; replaces fd reads, e.g. for HTTP ranges. */
+  void *reader_ctx;
   uint64_t size;
   uint32_t content_type;
   uint32_t content_flags;
@@ -111,6 +117,12 @@ read_at(int fd, void *buffer, size_t size, uint64_t offset) {
 }
 
 static int
+pkg_read(const pkg_source_t *pkg, void *buffer, size_t size, uint64_t offset) {
+  return pkg->reader ? pkg->reader(pkg->reader_ctx, buffer, size, offset) :
+    read_at(pkg->fd, buffer, size, offset);
+}
+
+static int
 png_signature_valid(const unsigned char *data, size_t size) {
   static const unsigned char signature[] = "\x89PNG\r\n\x1a\n";
 
@@ -123,7 +135,7 @@ pkg_icon_is_png(const pkg_source_t *pkg, uint64_t offset, uint32_t size) {
   unsigned char signature[8];
 
   return size >= sizeof(signature) &&
-         !read_at(pkg->fd, signature, sizeof(signature), offset) &&
+         !pkg_read(pkg, signature, sizeof(signature), offset) &&
          png_signature_valid(signature, sizeof(signature));
 }
 
@@ -133,11 +145,11 @@ pkg_source_close(pkg_source_t *pkg) {
   pkg->fd = -1;
 }
 
+/* Validates the header and entry table of an initialized source. */
 static int
-pkg_source_open_fd(int fd, int borrowed, pkg_source_t *pkg) {
+pkg_source_parse(pkg_source_t *pkg) {
   unsigned char header[PKG_HEADER_SIZE];
   unsigned char *table = NULL;
-  struct stat st;
   uint64_t container_offset = 0;
   uint64_t container_size;
   uint32_t magic;
@@ -146,14 +158,8 @@ pkg_source_open_fd(int fd, int borrowed, pkg_source_t *pkg) {
   size_t table_size;
   int ret = -1;
 
-  memset(pkg, 0, sizeof(*pkg));
-  pkg->fd = fd;
-  pkg->borrowed = borrowed;
-  if(pkg->fd < 0 || fstat(pkg->fd, &st) ||
-     !S_ISREG(st.st_mode) || st.st_size < PKG_HEADER_SIZE ||
-     read_at(pkg->fd, header, sizeof(header), 0)) goto done;
+  if(pkg->size < PKG_HEADER_SIZE || pkg_read(pkg, header, sizeof(header), 0)) goto done;
 
-  pkg->size = (uint64_t)st.st_size;
   magic = read_be32(header);
   pkg->platform = magic == PKG_FIH_MAGIC || magic == PKG_LIH_MAGIC ? 5 : 4;
   if(magic == PKG_FIH_MAGIC) {
@@ -165,7 +171,7 @@ pkg_source_open_fd(int fd, int borrowed, pkg_source_t *pkg) {
   }
   if(container_offset) {
     if(!range_valid(container_offset, sizeof(header), pkg->size) ||
-       read_at(pkg->fd, header, sizeof(header), container_offset) ||
+       pkg_read(pkg, header, sizeof(header), container_offset) ||
        read_be32(header) != PKG_CNT_MAGIC) goto done;
   }
   container_size = pkg->size - container_offset;
@@ -180,7 +186,7 @@ pkg_source_open_fd(int fd, int borrowed, pkg_source_t *pkg) {
   table_size = (size_t)entry_count * PKG_ENTRY_SIZE;
   if(!range_valid(table_offset, table_size, container_size) ||
      !(table = malloc(table_size)) ||
-     read_at(pkg->fd, table, table_size, container_offset + table_offset)) {
+     pkg_read(pkg, table, table_size, container_offset + table_offset)) {
     goto done;
   }
 
@@ -224,6 +230,22 @@ done:
     pkg_source_close(pkg);
   }
   return ret;
+}
+
+static int
+pkg_source_open_fd(int fd, int borrowed, pkg_source_t *pkg) {
+  struct stat st;
+
+  memset(pkg, 0, sizeof(*pkg));
+  pkg->fd = fd;
+  pkg->borrowed = borrowed;
+  if(pkg->fd < 0 || fstat(pkg->fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 0) {
+    errno = EINVAL;
+    pkg_source_close(pkg);
+    return -1;
+  }
+  pkg->size = (uint64_t)st.st_size;
+  return pkg_source_parse(pkg);
 }
 
 static int
@@ -580,15 +602,14 @@ append_param_json_fields(strbuf_t *json, const unsigned char *data,
   return 0;
 }
 
-int
-pkg_read_details(const char *path, pkg_details_t *details) {
-  pkg_source_t pkg = {.fd = -1};
+/* Takes ownership of an opened source. */
+static int
+pkg_source_details(pkg_source_t *source, pkg_details_t *details) {
+  pkg_source_t pkg = *source;
   strbuf_t fields = {0};
   unsigned char *param = NULL;
   int result = -1;
-  memset(details, 0, sizeof(*details));
-  if(pkg_source_open(path, &pkg)) return -1;
-  if(!(param = malloc(pkg.param_size)) || read_at(pkg.fd, param, pkg.param_size, pkg.param_offset)) goto done;
+  if(!(param = malloc(pkg.param_size)) || pkg_read(&pkg, param, pkg.param_size, pkg.param_offset)) goto done;
   details->platform = pkg.platform;
   details->has_icon = pkg.icon_size != 0;
   memcpy(details->content_id, pkg.content_id, sizeof(details->content_id));
@@ -600,6 +621,74 @@ pkg_read_details(const char *path, pkg_details_t *details) {
 done:
   free(fields.data); free(param); pkg_source_close(&pkg);
   if(result) memset(details, 0, sizeof(*details));
+  return result;
+}
+
+int
+pkg_read_details(const char *path, pkg_details_t *details) {
+  pkg_source_t pkg = {.fd = -1};
+  memset(details, 0, sizeof(*details));
+  if(pkg_source_open(path, &pkg)) return -1;
+  return pkg_source_details(&pkg, details);
+}
+
+int
+pkg_read_details_reader(pkg_read_fn reader, void *ctx, uint64_t size,
+                        pkg_details_t *details) {
+  pkg_source_t pkg = {.fd = -1, .reader = reader, .reader_ctx = ctx, .size = size};
+  memset(details, 0, sizeof(*details));
+  if(pkg_source_parse(&pkg)) return -1;
+  return pkg_source_details(&pkg, details);
+}
+
+typedef struct pkg_url_reader {
+  const http_url_t *url;
+  unsigned char *window;
+  size_t window_size;
+  http_result_t error;
+  int status;
+} pkg_url_reader_t;
+
+static int
+pkg_url_read(void *ctx, void *buffer, size_t size, uint64_t offset) {
+  pkg_url_reader_t *reader = ctx;
+  http_range_response_t response;
+
+  if(offset <= reader->window_size && size <= reader->window_size - offset) {
+    memcpy(buffer, reader->window + offset, size);
+    return 0;
+  }
+  if(!size) return 0;
+  reader->error = http_range_get(reader->url, offset, size, buffer, PKG_URL_TIMEOUT_MS, &response);
+  reader->status = response.status;
+  if(!reader->error && response.received != size) reader->error = HTTP_ERR_INCOMPLETE;
+  return reader->error ? -1 : 0;
+}
+
+/* Reads metadata with bounded Range requests; the package body is never fetched. */
+int
+pkg_read_details_url(const http_url_t *url, pkg_details_t *details,
+                     uint64_t *size, http_result_t *error, int *status) {
+  pkg_url_reader_t reader = {.url = url};
+  http_range_response_t response;
+  int result = -1;
+
+  memset(details, 0, sizeof(*details));
+  *size = 0;
+  if(!(reader.window = malloc(PKG_URL_WINDOW))) {
+    *error = HTTP_ERR_NO_MEMORY;
+    return -1;
+  }
+  *error = http_range_get(url, 0, PKG_URL_WINDOW, reader.window, PKG_URL_TIMEOUT_MS, &response);
+  *status = response.status;
+  if(!*error) {
+    reader.window_size = response.received;
+    *size = response.total;
+    result = pkg_read_details_reader(pkg_url_read, &reader, response.total, details);
+    *error = reader.error;
+    if(reader.error) *status = reader.status;
+  }
+  free(reader.window);
   return result;
 }
 

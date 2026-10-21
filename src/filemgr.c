@@ -31,6 +31,7 @@
 #include "smb.h"
 #include "vfs.h"
 #include "transfer.h"
+#include "http_range.h"
 
 #define TRANSFER_ALERT_THRESHOLD (10 * 60)
 
@@ -1802,7 +1803,9 @@ pkg_task_worker(void *arg) {
     task->updated_at = time(NULL);
     pthread_mutex_unlock(&g_tasks_lock);
 
-    result = pkg_installer_install(task->srcs[0]);
+    result = task->pkg_details ?
+      pkg_installer_install_url(task->srcs[0], task->pkg_details) :
+      pkg_installer_install(task->srcs[0]);
     if(result) {
       char error_code[16];
       snprintf(error_code, sizeof(error_code), "0x%08X", (unsigned int)result);
@@ -1825,6 +1828,22 @@ active_pkg_task_locked(const char *path) {
        !strcmp(task->srcs[0], path)) return task;
   }
   return NULL;
+}
+#endif
+
+#ifndef __linux__
+static int
+start_pkg_worker_locked(void) {
+  int result = 0;
+
+  if(!g_pkg_worker_started) {
+    result = pthread_create(&g_pkg_worker_thread, NULL, pkg_task_worker, NULL);
+    if(!result) {
+      pthread_detach(g_pkg_worker_thread);
+      g_pkg_worker_started = 1;
+    }
+  }
+  return result;
 }
 #endif
 
@@ -1856,13 +1875,7 @@ enqueue_pkg_tasks(char **paths, size_t count, unsigned long *ids) {
   }
 
   pthread_mutex_lock(&g_tasks_lock);
-  if(!g_pkg_worker_started) {
-    result = pthread_create(&g_pkg_worker_thread, NULL, pkg_task_worker, NULL);
-    if(!result) {
-      pthread_detach(g_pkg_worker_thread);
-      g_pkg_worker_started = 1;
-    }
-  }
+  result = start_pkg_worker_locked();
   if(!result) {
     for(size_t i = 0; i < count; i++) {
       file_task_t *existing = active_pkg_task_locked(paths[i]);
@@ -1946,6 +1959,132 @@ api_install_pkg(struct MHD_Connection *conn, const char *body,
   return send_buffer(conn, MHD_HTTP_OK, json.data, "application/json");
 }
 
+/* Takes ownership of details. task->src shows the URL without its query. */
+static int
+enqueue_pkg_url_task(const http_url_t *url, pkg_details_t *details,
+                     unsigned long *id, int *existing) {
+#ifdef __linux__
+  (void)url; (void)id; (void)existing;
+  free(details);
+  return PKG_INSTALL_UNSUPPORTED;
+#else
+  file_task_t *task = calloc(1, sizeof(*task));
+  int result;
+
+  if(!task || !(task->srcs = calloc(1, sizeof(*task->srcs))) ||
+     !(task->srcs[0] = strdup(url->canonical))) {
+    free_task(task);
+    free(details);
+    return -1;
+  }
+  task->op = TASK_PKG_INSTALL;
+  task->state = TASK_QUEUED;
+  task->src_count = 1;
+  task->pkg_details = details;
+  snprintf(task->src, sizeof(task->src), "%s", url->redacted);
+  task->created_at = time(NULL);
+  task->updated_at = task->created_at;
+
+  pthread_mutex_lock(&g_tasks_lock);
+  *existing = 0;
+  for(file_task_t *item = g_tasks; item; item = item->next) {
+    /* Same URL, or the same content from another URL, is already queued. */
+    if(item->op == TASK_PKG_INSTALL && task_is_active(item) &&
+       (!strcmp(item->srcs[0], task->srcs[0]) ||
+        (details->content_id[0] && item->pkg_details &&
+         !strcmp(item->pkg_details->content_id, details->content_id)))) {
+      *id = item->id;
+      *existing = 1;
+      break;
+    }
+  }
+  result = *existing ? 0 : start_pkg_worker_locked();
+  if(!result && !*existing) {
+    task->id = g_next_task_id++;
+    *id = task->id;
+    task->next = g_tasks;
+    g_tasks = task;
+    task = NULL;
+    pthread_cond_signal(&g_pkg_tasks_cond);
+  }
+  pthread_mutex_unlock(&g_tasks_lock);
+  free_task(task);
+  return result;
+#endif
+}
+
+static enum MHD_Result
+api_install_pkg_url(struct MHD_Connection *conn, const char *body,
+                    size_t body_size) {
+  char *text = body_form_value(body, body_size, "url");
+  http_url_t *url = calloc(1, sizeof(*url));
+  pkg_details_t *details = calloc(1, sizeof(*details));
+  http_result_t error = HTTP_OK;
+  uint64_t size = 0;
+  unsigned long id = 0;
+  int existing = 0;
+  int status = 0;
+  int result;
+  strbuf_t json = {0};
+
+  if(!url || !details) {
+    free(text); free(url); free(details);
+    return send_json_error(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "out of memory");
+  }
+  if((error = http_url_parse(text, url))) {
+    enum MHD_Result ret = send_json_error_detail(conn, MHD_HTTP_BAD_REQUEST,
+      http_result_message(error), http_result_code(error), NULL);
+    free(text); free(url); free(details);
+    return ret;
+  }
+  free(text);
+  if(pkg_read_details_url(url, details, &size, &error, &status)) {
+    /* Never echo the query string: it may carry access tokens. */
+    char arg[sizeof(url->redacted) + 16];
+    enum MHD_Result ret;
+    if(status && error != HTTP_ERR_PROTOCOL) snprintf(arg, sizeof(arg), "HTTP %d, %s", status, url->redacted);
+    else snprintf(arg, sizeof(arg), "%s", url->redacted);
+    ret = error ?
+      send_json_error_detail(conn, MHD_HTTP_BAD_GATEWAY, http_result_message(error),
+                             http_result_code(error), arg) :
+      send_json_error_detail(conn, MHD_HTTP_BAD_REQUEST, "could not read package information",
+                             "pkg_info_failed", url->redacted);
+#if WFM_DEBUG
+    fprintf(stderr, "PKG URL probe failed: %s (%s)\n", url->redacted, http_result_code(error));
+#endif
+    free(url); free(details);
+    return ret;
+  }
+  if(!details->title[0]) {
+    const char *path = url->target;
+    size_t length = strcspn(path, "?");
+    const char *name = path;
+    for(size_t i = 0; i < length; i++) if(path[i] == '/') name = path + i + 1;
+    snprintf(details->title, sizeof(details->title), "%.*s", (int)(length - (size_t)(name - path)), name);
+  }
+
+  result = enqueue_pkg_url_task(url, details, &id, &existing);
+  if(result == PKG_INSTALL_UNSUPPORTED) {
+    free(url);
+    return send_json_error_detail(conn, MHD_HTTP_NOT_IMPLEMENTED,
+                                  "package installation is only available on PS5",
+                                  "pkg_install_unsupported", NULL);
+  }
+  if(result) {
+    free(url);
+    return send_json_error(conn, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                           "could not queue package installation");
+  }
+  /* Keep the action from completing instantly after an accidental press. */
+  if(!existing) usleep(600000);
+  strbuf_printf(&json, "{\"ok\":true,\"task_ids\":[%lu],\"existing\":%s,\"size\":%llu,\"url\":",
+                id, existing ? "true" : "false", (unsigned long long)size);
+  json_escape(&json, url->redacted);
+  strbuf_append(&json, "}");
+  free(url);
+  return send_buffer(conn, MHD_HTTP_OK, json.data, "application/json");
+}
+
 enum MHD_Result
 filemgr_api_request(struct MHD_Connection *conn, const char *url,
                     const char *method, const char *body, size_t body_size) {
@@ -2011,6 +2150,11 @@ filemgr_api_request(struct MHD_Connection *conn, const char *url,
     return strcmp(method, MHD_HTTP_METHOD_POST) ?
       send_json_error(conn, MHD_HTTP_METHOD_NOT_ALLOWED, "invalid method") :
       api_install_pkg(conn, body, body_size);
+  }
+  if(!strcmp(url, "/api/install-pkg-url")) {
+    return strcmp(method, MHD_HTTP_METHOD_POST) ?
+      send_json_error(conn, MHD_HTTP_METHOD_NOT_ALLOWED, "invalid method") :
+      api_install_pkg_url(conn, body, body_size);
   }
   if(!strcmp(url, "/api/text")) {
     return strcmp(method, MHD_HTTP_METHOD_GET) ?

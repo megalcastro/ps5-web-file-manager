@@ -33,6 +33,8 @@ typedef struct task_eta_sample {
   struct timespec time;
 } task_eta_sample_t;
 
+struct pkg_details;
+
 typedef struct file_task {
   unsigned long id;
   task_op_t op;
@@ -47,6 +49,7 @@ typedef struct file_task {
   size_t src_count;
   char *password;
   char **extract_destinations;
+  struct pkg_details *pkg_details; /* URL installs: metadata read before queueing. */
   int extract_attached;
   size_t file_count;
   size_t dir_count;

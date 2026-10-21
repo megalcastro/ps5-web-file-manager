@@ -77,6 +77,7 @@ free_task(file_task_t *task) {
   }
   free_paths(task->srcs, task->src_count);
   free_paths(task->extract_destinations, task->src_count);
+  free(task->pkg_details);
   if(task->password) {
     memset(task->password, 0, strlen(task->password));
     free(task->password);

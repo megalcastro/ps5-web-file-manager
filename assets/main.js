@@ -111,6 +111,7 @@ const textEditorStatusEl = document.getElementById("textEditorStatus");
 const textEditorCloseBtn = document.getElementById("textEditorCloseBtn");
 const textEditorSaveBtn = document.getElementById("textEditorSaveBtn");
 const newTextBtn = document.getElementById("newTextBtn");
+const installUrlBtn = document.getElementById("installUrlBtn");
 const imagePreviewOverlayEl = document.getElementById("imagePreviewOverlay");
 const imagePreviewNameEl = document.getElementById("imagePreviewName");
 const imagePreviewEl = document.getElementById("imagePreview");
@@ -594,6 +595,9 @@ function handleTerminalTask(task) {
       const message = taskFailureMessage(task);
       setStatus(message);
       alert(message);
+    } else if (task.state === "done" && /^http:\/\//i.test(task.src || "")) {
+      // "done" only means the system installer accepted the request.
+      setStatus(t("pkgUrlInstallAccepted", { name: task.src }));
     }
     return false;
   }
@@ -1222,6 +1226,38 @@ async function queuePkgInstall(items) {
 
 function installPkg(item) {
   return queuePkgInstall([item]);
+}
+
+async function actionInstallFromUrl() {
+  if (busy || loadingPath) return;
+  const input = prompt(t("pkgUrlPrompt"), "http://");
+  if (typeof input !== "string") return;
+  const url = input.trim();
+  if (!url || /^http:\/\/$/i.test(url)) return;
+  // The backend validates authoritatively; this only avoids an obvious round trip.
+  if (!/^http:\/\//i.test(url)) {
+    showActionFailed(t("installFromUrl"),
+      t(/^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? "err_pkg_url_scheme" : "err_pkg_url_invalid"));
+    return;
+  }
+  try {
+    localActionBusy = true;
+    setBusy(true);
+    setStatus(t("pkgUrlChecking"));
+    const data = await apiForm("/api/install-pkg-url", { url });
+    const message = t(data.existing ? "pkgUrlInstallExisting" : "pkgUrlInstallQueued", {
+      name: data.url,
+      size: formatBytes(data.size, true)
+    });
+    setStatus(message);
+    alert(message);
+    await pollTasks();
+  } catch (err) {
+    showActionFailed(t("installFromUrl"), err.message);
+  } finally {
+    localActionBusy = false;
+    if (overlayEl.hidden && !taskOverlayTimer) setBusy(false);
+  }
 }
 
 function actionInstallSelectedPkgs() {
@@ -1893,6 +1929,7 @@ function updateButtons() {
   uploadFolderEl.disabled = locked;
   document.getElementById("mkdirBtn").disabled = locked;
   newTextBtn.disabled = locked;
+  installUrlBtn.disabled = locked;
   for (const button of filesEl.querySelectorAll(".row-action, .mode-action, .row-tool")) {
     button.disabled = locked || (/^smb:\/\//.test(cwd) && button.classList.contains("mode-action"));
   }
@@ -3061,6 +3098,7 @@ nameFilterBtn.addEventListener("click", event => {
 textEditorCloseBtn.addEventListener("click", requestCloseTextEditor);
 textEditorSaveBtn.addEventListener("click", saveTextEditor);
 newTextBtn.addEventListener("click", actionNewText);
+installUrlBtn.addEventListener("click", actionInstallFromUrl);
 imagePreviewCloseBtn.addEventListener("click", closeImagePreview);
 pkgInfoCloseBtn.addEventListener("click", closePkgInfo);
 pkgInfoInstallBtn.addEventListener("click", installPkgFromInfo);

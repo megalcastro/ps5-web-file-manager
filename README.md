@@ -41,6 +41,7 @@ PS5 web file manager payload. It runs an HTTP UI starting at port `8888`, regist
 - Create/edit text files ending with `.txt`, `.json`, `.xml`, `.ini`, `.cfg`, `.conf`, `.md`, `.log`, `.lua`, `.js`, `.css`, `.html`, `.htm`, `.c`, `.h`, `.cpp`, `.hpp`, `.sh`, `.csv`, `.yaml`, `.yml`, `.shn`.
 - Preview image files ending with `.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`.
 - Install/Preview PKG files ends with `.pkg`.
+- Install a PKG directly from an `http://` URL on the local network (**Install from URL**). The PS5 system installer fetches the package itself; nothing is staged on PS5 storage. See [Install PKG from URL](#install-pkg-from-url).
 - Launch payload files ending with `.elf` by sending them to the ELF loader at `localhost:9021` after confirmation.
 
 ## Build
@@ -50,6 +51,21 @@ It depends on PS5 payload SDK first: [ps5-payload-dev/sdk](https://github.com/ps
 ```sh
 export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 ```
+
+On macOS (Homebrew, Apple Silicon). Besides the SDK README's steps, this project also needs `cmake` (libsmb2), `pkgconf`, and GNU `sed`: the SDK's `prospero-cross-fix-root` uses GNU `sed -i` syntax, which fails with macOS `sed` ("sed: -e: No such file or directory"). The SDK works from any directory, so it can be unpacked without `sudo`:
+
+```sh
+brew install llvm@18 wget cmake pkgconf gnu-sed socat
+wget https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip
+unzip -d "$HOME" ps5-payload-sdk.zip            # or: sudo unzip -d /opt ps5-payload-sdk.zip
+export LLVM_CONFIG=/opt/homebrew/opt/llvm@18/bin/llvm-config
+export PS5_PAYLOAD_SDK="$HOME/ps5-payload-sdk"  # or /opt/ps5-payload-sdk
+export PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:$PATH"
+git submodule update --init --recursive
+make
+```
+
+Only a successful `make` with `PS5_PAYLOAD_SDK` set produces a real PS5 payload (`web-file-mgr.elf`).
 
 This project uses `libmicrohttpd` for HTTP and `libsmb2` for SMB. `make` checks for `libmicrohttpd` before building and runs the installer script automatically if it is missing:
 
@@ -83,7 +99,17 @@ make linux
 ./web-file-mgr-linux
 ```
 
-The Linux build does not include the PS5 home screen installer.
+The Linux build does not include the PS5 home screen installer. It also leaves out all package installation: `pkg_installer_install()` and `pkg_installer_install_url()` return `PKG_INSTALL_UNSUPPORTED`, the PKG task worker is not compiled, and `/api/install-pkg-url` validates the URL and remote PKG, then answers `501 pkg_install_unsupported`. `make linux` must be run on Linux; on macOS the non-Linux (PS5) code paths are selected and the host build does not work.
+
+### Tests
+
+Host-side tests need only a C compiler and Python 3.7+ (no SDK, no libmicrohttpd):
+
+```sh
+python3 tests/run_tests.py
+```
+
+They build `tests/test_http_range.c` and `tests/test_pkg_url.c` against the real `src/http_range.c` and `src/pkg_info.c` (with a test-only `tests/stubs/microhttpd.h`). They check URL validation, Content-Range parsing, and good and malformed HTTP responses from a scripted server: 200-instead-of-206, redirects, 4xx/5xx, truncated bodies, chunked encoding, bad ranges, and timeouts. They also read PKG metadata over ranges from a sparse PKG larger than 4 GiB, and confirm that `python3 -m http.server` is rejected.
 
 ## Usage
 
@@ -103,6 +129,35 @@ http://${PS5_IP_ADDRESS}:8888/
 ```
 
 On startup the payload registers a `PS5 Web File Manager` web shortcut in the Media category. Missing launcher files are written; existing icons and names are preserved. Only the loopback URL in `param.json` is updated to the actual listen port, including fallback ports such as `8889`.
+
+## Install PKG from URL
+
+Use **Install from URL** in the toolbar and enter a URL such as `http://192.168.1.60:8080/EP0102-PPSA31246_00-REREQUIEM0000000.pkg`.
+
+1. The URL is validated. Only `http://host[:port]/path.pkg[?query]` is accepted. HTTPS, embedded credentials, fragments, IPv6 literals and non-ASCII characters are rejected; percent-encode spaces and non-ASCII names.
+2. The payload makes bounded `GET` requests with `Range` (256 KiB first, then small reads where the PKG entry table points) and parses the PKG header and `param.sfo`/`param.json` with the same parser used for local PKGs. Only a `206` with a `Content-Range` matching the request is accepted. A `200 OK` means the server ignored `Range`; it is rejected at once and the body is not read. Redirects are not followed, because the PS5 installer would be handed the original URL.
+3. The URL is queued on the existing PKG install worker (duplicate URLs or content IDs already queued are reported, not queued twice) and passed to `sceAppInstUtilInstallByPackage()`, the same call that already installs SMB packages through a loopback HTTP URL.
+4. **The PS5 system installer then downloads and installs the package.** Progress, speed, cancellation and completion appear in the PS5 Downloads/notifications, not in this app. The task finishing here only means the system accepted the request. Keep the HTTP server running until the installation completes.
+
+Query strings are never shown in the task list or error messages (they may carry tokens). Package icons are not passed to the installer for URL installs.
+
+### HTTP server requirements
+
+The server must support HTTP byte ranges (`206 Partial Content`). **`python3 -m http.server` does not**: it ignores `Range` and always returns the whole file with `200 OK`, so it is rejected with a "server does not support byte-range requests" error.
+
+A stdlib-only, Range-capable replacement is included:
+
+```sh
+python3 tools/range_http_server.py --port 8080 /path/to/folder/with/pkgs
+```
+
+Check any server before using it (expect `206` and a matching `Content-Range`):
+
+```sh
+curl -s -D - -o /dev/null -r 0-15 http://192.168.1.60:8080/EP0102-PPSA31246_00-REREQUIEM0000000.pkg
+```
+
+On macOS, allow incoming connections for `python3` if the firewall asks.
 
 ## Notes
 

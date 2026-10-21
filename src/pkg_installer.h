@@ -4,6 +4,9 @@
 
 int pkg_installer_initialize(void);
 int pkg_installer_install(const char *path);
+/* Submits a validated http:// URL; the system installer fetches it directly. */
+struct pkg_details;
+int pkg_installer_install_url(const char *url, const struct pkg_details *details);
 
 /* An acquired source keeps its file/context alive until release. */
 typedef struct pkg_install_source pkg_install_source_t;

@@ -116,6 +116,19 @@ pkg_installer_initialize(void) {
   return result;
 }
 
+static int
+submit_install(const pkg_metadata_t *metadata) {
+  pkg_info_t pkg_info = {0};
+  playgo_info_t playgo_info = {0};
+  int result;
+
+  pthread_mutex_lock(&installer_lock);
+  result = initialize_locked();
+  if(!result) result = sceAppInstUtilInstallByPackage(metadata, &pkg_info, &playgo_info);
+  pthread_mutex_unlock(&installer_lock);
+  return result;
+}
+
 int
 pkg_installer_install(const char *path) {
   char install_path[PATH_MAX + 128];
@@ -133,8 +146,6 @@ pkg_installer_install(const char *path) {
     .slot = 0,
     .is_playgo_enabled = 0
   };
-  pkg_info_t pkg_info = {0};
-  playgo_info_t playgo_info = {0};
   int result;
   int remote;
 
@@ -176,10 +187,7 @@ pkg_installer_install(const char *path) {
   }
   metadata.uri = uri;
 
-  pthread_mutex_lock(&installer_lock);
-  result = initialize_locked();
-  if(!result) result = sceAppInstUtilInstallByPackage(&metadata, &pkg_info, &playgo_info);
-  pthread_mutex_unlock(&installer_lock);
+  result = submit_install(&metadata);
   if(result && source) {
     pthread_mutex_lock(&sources_lock);
     pkg_install_source_t **link = &sources;
@@ -189,6 +197,26 @@ pkg_installer_install(const char *path) {
     pkg_installer_source_release(source);
   }
   return result;
+}
+
+int
+pkg_installer_install_url(const char *url, const pkg_details_t *details) {
+  pkg_metadata_t metadata;
+
+  if(!url || !details || strncmp(url, "http://", 7)) return -1;
+  /* Same metadata as SMB sources, which already install from an HTTP URI.
+     The caller sets a title (falling back to the file name, never the query). */
+  metadata = (pkg_metadata_t){
+    .uri = url,
+    .ex_uri = "",
+    .playgo_scenario_id = "",
+    .content_id = details->content_id,
+    .content_name = details->title,
+    .icon_url = "",
+    .slot = 0,
+    .is_playgo_enabled = 0
+  };
+  return submit_install(&metadata);
 }
 
 #else
@@ -201,6 +229,12 @@ pkg_installer_initialize(void) {
 int
 pkg_installer_install(const char *path) {
   (void)path;
+  return PKG_INSTALL_UNSUPPORTED;
+}
+
+int
+pkg_installer_install_url(const char *url, const pkg_details_t *details) {
+  (void)url; (void)details;
   return PKG_INSTALL_UNSUPPORTED;
 }
 
